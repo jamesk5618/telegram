@@ -253,8 +253,14 @@ def build_summary_message(greeting: str) -> str:
     total_expected = 0.0
     total_collected = 0.0
     for name, expected, paid in clients:
-        status = "✅ Paid" if paid >= expected and expected > 0 else "⏳ Pending"
-        lines.append(f"• {name} — ₹{expected:,.0f} ({status})")
+        remaining = expected - paid
+        if remaining <= 0:
+            status = f"✅ Paid ₹{expected:,.0f}"
+        elif paid > 0:
+            status = f"⏳ ₹{paid:,.0f} paid, ₹{remaining:,.0f} pending"
+        else:
+            status = f"⏳ ₹{remaining:,.0f} pending"
+        lines.append(f"• {name} — {status}")
         total_expected += expected
         total_collected += paid
 
