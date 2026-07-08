@@ -152,11 +152,14 @@ def get_clients_with_payment(headers, data_rows, month_col_idx):
     return clients
 
 
-def mark_payment(name: str, month_name: str) -> float:
+def mark_payment(name: str, month_name: str, amount: float = None) -> float:
     """
-    Marks the given client's payment as done for the given month by writing
-    their package amount into that month's column. Returns the amount
-    written. Raises ValueError if the client or the month column isn't found.
+    Marks a payment for the given client/month. If `amount` is given, that
+    amount is ADDED to whatever's already in that month's cell (so partial
+    payments accumulate). If `amount` is None, the client's full package
+    price is written in (marks the month fully paid). Returns the new total
+    paid amount for that client/month. Raises ValueError if the client or
+    the month column isn't found.
     """
     ws = get_worksheet()
     all_values = ws.get_all_values()
@@ -176,11 +179,22 @@ def mark_payment(name: str, month_name: str) -> float:
         if len(row) >= COL_CLIENT and row[COL_CLIENT - 1].strip().lower() == target:
             package_raw = row[COL_PACKAGE - 1].strip() if len(row) >= COL_PACKAGE else ""
             try:
-                amount = float(package_raw.replace(",", ""))
+                package_price = float(package_raw.replace(",", ""))
             except ValueError:
                 raise ValueError(f"'{name}' has no valid package amount in column B.")
-            ws.update_cell(idx, month_col, amount)
-            return amount
+
+            if amount is None:
+                new_total = package_price
+            else:
+                existing_raw = row[month_col - 1].strip() if len(row) >= month_col else ""
+                try:
+                    existing_paid = float(existing_raw.replace(",", ""))
+                except ValueError:
+                    existing_paid = 0.0
+                new_total = existing_paid + amount
+
+            ws.update_cell(idx, month_col, new_total)
+            return new_total
 
     raise ValueError(f"No client found matching: {name}")
 
@@ -188,6 +202,22 @@ def mark_payment(name: str, month_name: str) -> float:
 def add_client(name: str, package: float):
     ws = get_worksheet()
     ws.append_row([name, package], value_input_option="USER_ENTERED")
+
+
+def edit_client_price(name: str, new_price: float) -> bool:
+    """
+    Updates a client's package price (column B). Returns True if found and
+    updated, False if no matching client.
+    """
+    ws = get_worksheet()
+    rows = ws.get_all_values()
+    target = name.strip().lower()
+
+    for idx, row in enumerate(rows[1:], start=2):
+        if len(row) >= COL_CLIENT and row[COL_CLIENT - 1].strip().lower() == target:
+            ws.update_cell(idx, COL_PACKAGE, new_price)
+            return True
+    return False
 
 
 def remove_client(name: str) -> bool:
@@ -354,21 +384,41 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handles messages like:
-        John Doe July done
-        John Doe Jul done
-    Marks that client's payment as done for that month.
+        John Doe July done              -> marks full package price as paid
+        John Doe July done 2000         -> adds a partial payment of 2000
     """
     text = update.message.text.strip()
     words = text.split()
 
-    if len(words) < 3 or words[-1].lower() != "done":
+    if len(words) < 3:
         await update.message.reply_text(
-            "Please use the format:\nClient Name Month done\n(e.g. John Doe July done)"
+            "Please use the format:\nClient Name Month done\nor\nClient Name Month done 2000\n"
+            "(e.g. John Doe July done  /  John Doe July done 2000)"
         )
         return
 
-    month_name = words[-2]
-    name = " ".join(words[:-2])
+    partial_amount = None
+    if words[-1].lower() != "done":
+        # last word might be a partial amount, second-last should be "done"
+        if len(words) >= 4 and words[-2].lower() == "done":
+            try:
+                partial_amount = float(words[-1].replace(",", ""))
+            except ValueError:
+                await update.message.reply_text(
+                    "Couldn't read the payment amount. Please use:\n"
+                    "Client Name Month done 2000"
+                )
+                return
+            month_name = words[-3]
+            name = " ".join(words[:-3])
+        else:
+            await update.message.reply_text(
+                "Please use the format:\nClient Name Month done\nor\nClient Name Month done 2000"
+            )
+            return
+    else:
+        month_name = words[-2]
+        name = " ".join(words[:-2])
 
     if not name:
         await update.message.reply_text(
@@ -377,7 +427,7 @@ async def payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        amount = mark_payment(name, month_name)
+        new_total = mark_payment(name, month_name, partial_amount)
     except ValueError as e:
         await update.message.reply_text(f"⚠️ {e}")
         return
@@ -386,9 +436,60 @@ async def payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Failed to update the sheet: {e}")
         return
 
-    await update.message.reply_text(
-        f"✅ Marked {name}'s {month_name.title()} payment as done — ₹{amount:,.0f}"
-    )
+    if partial_amount is not None:
+        await update.message.reply_text(
+            f"✅ Added ₹{partial_amount:,.0f} for {name}'s {month_name.title()} payment "
+            f"— total paid so far: ₹{new_total:,.0f}"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Marked {name}'s {month_name.title()} payment as done — ₹{new_total:,.0f}"
+        )
+
+
+async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles messages like:
+        edit John Doe 6000
+        /edit John Doe 6000
+    Updates that client's package price.
+    """
+    text = update.message.text.strip()
+
+    if text.lower().startswith("/edit"):
+        text = text[5:].strip()
+    elif text.lower().startswith("edit"):
+        text = text[4:].strip()
+
+    parts = text.split()
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Please use the format:\nedit Client Name NewPrice\n(e.g. edit John Doe 6000)"
+        )
+        return
+
+    price_str = parts[-1]
+    name = " ".join(parts[:-1])
+
+    try:
+        new_price = float(price_str.replace(",", ""))
+    except ValueError:
+        await update.message.reply_text(
+            "Couldn't read the price. Please use:\nedit Client Name NewPrice\n(e.g. edit John Doe 6000)"
+        )
+        return
+
+    try:
+        found = edit_client_price(name, new_price)
+    except Exception as e:
+        logger.exception("Failed to edit client price")
+        await update.message.reply_text(f"⚠️ Failed to update the sheet: {e}")
+        return
+
+    if found:
+        await update.message.reply_text(f"✏️ Updated {name}'s package price to ₹{new_price:,.0f}")
+    else:
+        await update.message.reply_text(f"⚠️ No client found matching: {name}")
 
 
 async def plain_text_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -402,9 +503,11 @@ async def plain_text_dispatcher(update: Update, context: ContextTypes.DEFAULT_TY
         await add_command(update, context)
     elif text.startswith("remove "):
         await remove_command(update, context)
+    elif text.startswith("edit "):
+        await edit_command(update, context)
     elif text in ("total client", "total clients"):
         await total_client_command(update, context)
-    elif text.endswith(" done"):
+    elif text.endswith(" done") or " done " in text:
         await payment_command(update, context)
 
 
@@ -422,6 +525,7 @@ def main():
     app.add_handler(CommandHandler("summary", summary_command))
     app.add_handler(CommandHandler("add", add_command))
     app.add_handler(CommandHandler("remove", remove_command))
+    app.add_handler(CommandHandler("edit", edit_command))
     app.add_handler(CommandHandler("total", total_client_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text_dispatcher))
 
