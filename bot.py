@@ -2,16 +2,19 @@
 Telegram Client Tracker Bot
 ----------------------------
 Reads client + package data from a Google Sheet and:
-  1. Posts a summary (client names + package amount + total) to a Telegram
-     group every morning and every night.
-  2. Lets you add a new client row by typing in the group:
-         add <Client Name> <Package Price>
-     e.g.   add John Doe 1500
+  1. Posts a summary (client names, package amount, paid/pending, total) to
+     a Telegram group every morning and every night.
+  2. Lets you add a new client through a step-by-step chat flow:
+         add <Client Name>
+     The bot then asks for package price, posting frequency, platform(s),
+     and additional services, and auto-fills today's date as Joining Date.
+  3. Lets you edit, remove, and mark payments for existing clients.
 
 Setup instructions are in README.md.
 """
 
 import os
+import re
 import json
 import logging
 import threading
@@ -26,6 +29,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
 )
@@ -50,21 +54,27 @@ if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") and not os.path.exists(SERVICE_
 MORNING_TIME = time(hour=9, minute=0, tzinfo=ZoneInfo(TIMEZONE))
 NIGHT_TIME = time(hour=21, minute=0, tzinfo=ZoneInfo(TIMEZONE))
 
-# Column layout in the sheet (1-indexed, matches your current sheet)
+# Column layout in the sheet (1-indexed; A=1, B=2, C=3 ...)
 COL_CLIENT = 1   # A - Clients
 COL_PACKAGE = 2  # B - Package
 COL_EMAIL = 3    # C - Email
+
+# These columns are found dynamically by header name (since month columns
+# sit between the fixed columns above and these, and their position can
+# shift). Header text must match what's in your sheet's row 1.
+HEADER_FREQUENCY = "Frequency"
+HEADER_PLATFORM = "Platform"
+HEADER_ADDITIONAL = "Additional"
+HEADER_JOINING_DATE = "Joining Date"
+
+ALLOWED_PLATFORMS = ["Instagram", "Facebook", "YouTube", "LinkedIn"]
+DATE_FORMAT = "%d-%m-%Y"  # used for Joining Date, e.g. 18-09-2026
 
 PORT = int(os.environ.get("PORT", 8080))
 
 # ---------------------------------------------------------------------------
 # Keep-alive web server (for Render + UptimeRobot)
 # ---------------------------------------------------------------------------
-# Render's free tier sleeps a Web Service after ~15 min with no inbound HTTP
-# traffic. The bot's Telegram polling is all outbound, so Render doesn't see
-# it as activity. Pinging this endpoint every 5 min with UptimeRobot (or
-# similar) keeps the service awake, which also keeps the scheduled
-# morning/night jobs firing on time.
 keep_alive_app = Flask(__name__)
 
 
@@ -104,6 +114,15 @@ def get_all_data():
     return all_values[0], all_values[1:]
 
 
+def find_column(headers, header_name: str):
+    """Finds the 1-indexed column number whose header exactly matches header_name (case-insensitive)."""
+    target = header_name.strip().lower()
+    for idx, h in enumerate(headers, start=1):
+        if h.strip().lower() == target:
+            return idx
+    return None
+
+
 def find_month_column(headers, month_name: str):
     """
     Finds the 1-indexed column number whose header matches month_name.
@@ -120,6 +139,13 @@ def find_month_column(headers, month_name: str):
 
 def current_month_name() -> str:
     return datetime.now(ZoneInfo(TIMEZONE)).strftime("%B")
+
+
+def set_cell_in_row(row: list, col_idx: int, value):
+    """Extends `row` with blanks if needed, then sets row[col_idx-1] = value."""
+    while len(row) < col_idx:
+        row.append("")
+    row[col_idx - 1] = value
 
 
 def get_clients_with_payment(headers, data_rows, month_col_idx):
@@ -145,7 +171,6 @@ def get_clients_with_payment(headers, data_rows, month_col_idx):
                 try:
                     paid = float(cell_val.replace(",", ""))
                 except ValueError:
-                    # allow plain "done"/"paid"/"yes" text in the cell too
                     if cell_val.lower() in ("done", "paid", "yes"):
                         paid = expected
         clients.append((name, expected, paid))
@@ -199,16 +224,40 @@ def mark_payment(name: str, month_name: str, amount: float = None) -> float:
     raise ValueError(f"No client found matching: {name}")
 
 
-def add_client(name: str, package: float):
+def add_client_full(name, price, frequency, platform, additional, joining_date):
+    """
+    Appends a new client row, filling in Frequency/Platform/Additional/
+    Joining Date wherever those headers are found in row 1 (regardless of
+    their column position), plus month columns left blank.
+    """
     ws = get_worksheet()
-    ws.append_row([name, package], value_input_option="USER_ENTERED")
+    headers = ws.row_values(1)
+    row = [""] * max(len(headers), COL_PACKAGE)
+
+    set_cell_in_row(row, COL_CLIENT, name)
+    set_cell_in_row(row, COL_PACKAGE, price)
+
+    freq_col = find_column(headers, HEADER_FREQUENCY)
+    if freq_col:
+        set_cell_in_row(row, freq_col, frequency)
+
+    platform_col = find_column(headers, HEADER_PLATFORM)
+    if platform_col:
+        set_cell_in_row(row, platform_col, platform)
+
+    additional_col = find_column(headers, HEADER_ADDITIONAL)
+    if additional_col:
+        set_cell_in_row(row, additional_col, additional)
+
+    joining_col = find_column(headers, HEADER_JOINING_DATE)
+    if joining_col:
+        set_cell_in_row(row, joining_col, joining_date)
+
+    ws.append_row(row, value_input_option="USER_ENTERED")
 
 
 def edit_client_price(name: str, new_price: float) -> bool:
-    """
-    Updates a client's package price (column B). Returns True if found and
-    updated, False if no matching client.
-    """
+    """Updates a client's package price (column B). Returns True if found and updated."""
     ws = get_worksheet()
     rows = ws.get_all_values()
     target = name.strip().lower()
@@ -233,6 +282,26 @@ def remove_client(name: str) -> bool:
     for idx, row in enumerate(rows[1:], start=2):  # start=2: row 1 is header
         if len(row) >= COL_CLIENT and row[COL_CLIENT - 1].strip().lower() == target:
             ws.delete_rows(idx)
+            return True
+    return False
+
+
+def set_joining_date(name: str, date_str: str) -> bool:
+    """Backfills the Joining Date for an existing client. Returns True if found."""
+    ws = get_worksheet()
+    all_values = ws.get_all_values()
+    if not all_values:
+        raise ValueError("Sheet is empty.")
+    headers, data_rows = all_values[0], all_values[1:]
+
+    joining_col = find_column(headers, HEADER_JOINING_DATE)
+    if not joining_col:
+        raise ValueError(f"No '{HEADER_JOINING_DATE}' column found in the sheet.")
+
+    target = name.strip().lower()
+    for idx, row in enumerate(data_rows, start=2):
+        if len(row) >= COL_CLIENT and row[COL_CLIENT - 1].strip().lower() == target:
+            ws.update_cell(idx, joining_col, date_str)
             return True
     return False
 
@@ -281,7 +350,7 @@ def build_summary_message(greeting: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Telegram handlers
+# Scheduled + on-demand summary handlers
 # ---------------------------------------------------------------------------
 async def send_morning_update(context: ContextTypes.DEFAULT_TYPE):
     msg = build_summary_message("☀️ Good morning! Here's today's client summary:")
@@ -300,65 +369,172 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def total_client_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Manual trigger: /total or the phrase "total client"
-    Same output as the scheduled morning/night summary.
-    """
+    """Manual trigger: /total or the phrase 'total client'"""
     msg = build_summary_message("📊 Total client list:")
     await update.message.reply_text(msg)
 
 
-async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles messages like:
-        add John Doe 1500
-        /add John Doe 1500
-    Last word must be the numeric package price; everything before it is the
-    client name.
-    """
+# ---------------------------------------------------------------------------
+# "add" conversation flow: add ClientName -> price -> frequency -> platform
+# -> additional -> saved with today's date as Joining Date
+# ---------------------------------------------------------------------------
+ASK_PRICE, ASK_FREQUENCY, ASK_PLATFORM, ASK_ADDITIONAL = range(4)
+
+
+async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-
-    # Strip leading "/add" or "add"
     if text.lower().startswith("/add"):
-        text = text[4:].strip()
+        name = text[4:].strip()
     elif text.lower().startswith("add"):
-        text = text[3:].strip()
+        name = text[3:].strip()
+    else:
+        name = text.strip()
 
-    parts = text.split()
-    if len(parts) < 2:
+    if not name:
         await update.message.reply_text(
-            "Please use the format:\nadd Client Name Price\n(e.g. add John Doe 1500)"
+            "Please include the client's name, e.g.:\nadd John Doe"
         )
-        return
+        return ConversationHandler.END
 
-    price_str = parts[-1]
-    name = " ".join(parts[:-1])
+    context.user_data["new_client"] = {"name": name}
+    await update.message.reply_text(
+        f"Adding new client: {name}\n\nWhat's the package price? (just the number, e.g. 1500)"
+    )
+    return ASK_PRICE
 
+
+async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
     try:
-        price = float(price_str.replace(",", ""))
+        price = float(text.replace(",", ""))
     except ValueError:
+        await update.message.reply_text("Please send just the numeric price, e.g. 1500")
+        return ASK_PRICE
+
+    context.user_data["new_client"]["price"] = price
+    await update.message.reply_text(
+        "Got it. What's the posting frequency this month?\n"
+        "Use P for posts and R for reels — e.g. 8P 4R"
+    )
+    return ASK_FREQUENCY
+
+
+async def add_frequency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not re.search(r"\d+\s*[PRpr]", text):
         await update.message.reply_text(
-            "Couldn't read the price. Please use:\nadd Client Name Price\n(e.g. add John Doe 1500)"
+            "Please include counts with P (posts) and/or R (reels) — e.g. 8P 4R"
         )
-        return
+        return ASK_FREQUENCY
+
+    context.user_data["new_client"]["frequency"] = text
+    await update.message.reply_text(
+        "Which platform(s)? Reply with any of these, comma-separated:\n"
+        f"{', '.join(ALLOWED_PLATFORMS)}"
+    )
+    return ASK_PLATFORM
+
+
+async def add_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    tokens = [t.strip() for t in text.split(",") if t.strip()]
+
+    matched = []
+    unmatched = []
+    for t in tokens:
+        hit = next((p for p in ALLOWED_PLATFORMS if p.lower() == t.lower()), None)
+        if hit:
+            matched.append(hit)
+        else:
+            unmatched.append(t)
+
+    if not matched:
+        await update.message.reply_text(
+            f"Please choose from: {', '.join(ALLOWED_PLATFORMS)} (comma-separated)"
+        )
+        return ASK_PLATFORM
+
+    if unmatched:
+        await update.message.reply_text(
+            f"Note: ignored unrecognized platform(s): {', '.join(unmatched)}"
+        )
+
+    context.user_data["new_client"]["platform"] = ", ".join(matched)
+    await update.message.reply_text(
+        "Any additional services? e.g. Website, SEO, GMB — comma-separated,\n"
+        "or type your own (e.g. 'Content Writing'), or send 'None'"
+    )
+    return ASK_ADDITIONAL
+
+
+async def add_additional(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    additional = "" if text.lower() == "none" else text
+
+    data = context.user_data.pop("new_client", None)
+    if not data:
+        await update.message.reply_text(
+            "Something went wrong — please start again with: add Client Name"
+        )
+        return ConversationHandler.END
+
+    joining_date = datetime.now(ZoneInfo(TIMEZONE)).strftime(DATE_FORMAT)
 
     try:
-        add_client(name, price)
+        add_client_full(
+            name=data["name"],
+            price=data["price"],
+            frequency=data["frequency"],
+            platform=data["platform"],
+            additional=additional,
+            joining_date=joining_date,
+        )
     except Exception as e:
-        logger.exception("Failed to add client to sheet")
-        await update.message.reply_text(f"⚠️ Failed to add entry to the sheet: {e}")
-        return
+        logger.exception("Failed to add client")
+        await update.message.reply_text(f"⚠️ Failed to add client to the sheet: {e}")
+        return ConversationHandler.END
 
-    await update.message.reply_text(f"✅ Added: {name} — ₹{price:,.0f}")
+    await update.message.reply_text(
+        "✅ Client added!\n\n"
+        f"👤 Name: {data['name']}\n"
+        f"💰 Package: ₹{data['price']:,.0f}\n"
+        f"📅 Frequency: {data['frequency']}\n"
+        f"📱 Platform: {data['platform']}\n"
+        f"➕ Additional: {additional or 'None'}\n"
+        f"🗓️ Joining Date: {joining_date}"
+    )
+    return ConversationHandler.END
 
 
+async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("new_client", None)
+    await update.message.reply_text("Cancelled adding client.")
+    return ConversationHandler.END
+
+
+add_conversation = ConversationHandler(
+    entry_points=[
+        CommandHandler("add", add_start),
+        MessageHandler(filters.Regex(r"(?i)^add\s+.+") & ~filters.COMMAND, add_start),
+    ],
+    states={
+        ASK_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_price)],
+        ASK_FREQUENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_frequency)],
+        ASK_PLATFORM: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_platform)],
+        ASK_ADDITIONAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_additional)],
+    },
+    fallbacks=[CommandHandler("cancel", add_cancel)],
+)
+
+
+# ---------------------------------------------------------------------------
+# Other command handlers
+# ---------------------------------------------------------------------------
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handles messages like:
+    Handles:
         remove John Doe
         /remove John Doe
-    Removes that client's row from the sheet (case-insensitive exact match
-    on the whole name).
     """
     text = update.message.text.strip()
 
@@ -389,7 +565,7 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handles messages like:
+    Handles:
         John Doe July done              -> marks full package price as paid
         John Doe July done 2000         -> adds a partial payment of 2000
     """
@@ -405,7 +581,6 @@ async def payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     partial_amount = None
     if words[-1].lower() != "done":
-        # last word might be a partial amount, second-last should be "done"
         if len(words) >= 4 and words[-2].lower() == "done":
             try:
                 partial_amount = float(words[-1].replace(",", ""))
@@ -455,7 +630,7 @@ async def payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handles messages like:
+    Handles:
         edit John Doe 6000
         /edit John Doe 6000
     Updates that client's package price.
@@ -498,19 +673,69 @@ async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ No client found matching: {name}")
 
 
+async def setjoin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Backfills a Joining Date for a client added before the bot existed.
+    Handles:
+        setjoin John Doe 15-06-2026
+        /setjoin John Doe 15-06-2026
+    Date format: DD-MM-YYYY
+    """
+    text = update.message.text.strip()
+
+    if text.lower().startswith("/setjoin"):
+        text = text[8:].strip()
+    elif text.lower().startswith("setjoin"):
+        text = text[7:].strip()
+
+    parts = text.split()
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Please use the format:\nsetjoin Client Name DD-MM-YYYY\n"
+            "(e.g. setjoin John Doe 15-06-2026)"
+        )
+        return
+
+    date_str = parts[-1]
+    name = " ".join(parts[:-1])
+
+    try:
+        datetime.strptime(date_str, DATE_FORMAT)
+    except ValueError:
+        await update.message.reply_text(
+            f"Please give the date as DD-MM-YYYY, e.g. 15-06-2026"
+        )
+        return
+
+    try:
+        found = set_joining_date(name, date_str)
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+    except Exception as e:
+        logger.exception("Failed to set joining date")
+        await update.message.reply_text(f"⚠️ Failed to update the sheet: {e}")
+        return
+
+    if found:
+        await update.message.reply_text(f"🗓️ Set {name}'s joining date to {date_str}")
+    else:
+        await update.message.reply_text(f"⚠️ No client found matching: {name}")
+
+
 async def plain_text_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Single dispatcher for plain (non-slash) text messages in the group.
-    Routes to the right handler based on the message's starting words.
+    Single dispatcher for plain (non-slash) text messages in the group that
+    aren't caught by the add-client conversation above.
     """
     text = (update.message.text or "").strip().lower()
 
-    if text.startswith("add "):
-        await add_command(update, context)
-    elif text.startswith("remove "):
+    if text.startswith("remove "):
         await remove_command(update, context)
     elif text.startswith("edit "):
         await edit_command(update, context)
+    elif text.startswith("setjoin "):
+        await setjoin_command(update, context)
     elif text in ("total client", "total clients"):
         await total_client_command(update, context)
     elif text.endswith(" done") or " done " in text:
@@ -529,10 +754,15 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("summary", summary_command))
-    app.add_handler(CommandHandler("add", add_command))
+    app.add_handler(CommandHandler("total", total_client_command))
     app.add_handler(CommandHandler("remove", remove_command))
     app.add_handler(CommandHandler("edit", edit_command))
-    app.add_handler(CommandHandler("total", total_client_command))
+    app.add_handler(CommandHandler("setjoin", setjoin_command))
+
+    # Conversation handler must be added before the generic dispatcher so
+    # "add ..." messages get captured by the step-by-step flow.
+    app.add_handler(add_conversation)
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text_dispatcher))
 
     app.job_queue.run_daily(send_morning_update, time=MORNING_TIME, name="morning_update")
