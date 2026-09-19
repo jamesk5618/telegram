@@ -18,6 +18,7 @@ import re
 import json
 import logging
 import threading
+import calendar
 from datetime import time, datetime
 from zoneinfo import ZoneInfo
 
@@ -53,6 +54,7 @@ if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") and not os.path.exists(SERVICE_
 
 MORNING_TIME = time(hour=9, minute=0, tzinfo=ZoneInfo(TIMEZONE))
 NIGHT_TIME = time(hour=21, minute=0, tzinfo=ZoneInfo(TIMEZONE))
+REMINDER_TIME = time(hour=10, minute=0, tzinfo=ZoneInfo(TIMEZONE))
 
 # Column layout in the sheet (1-indexed; A=1, B=2, C=3 ...)
 COL_CLIENT = 1   # A - Clients
@@ -146,6 +148,54 @@ def set_cell_in_row(row: list, col_idx: int, value):
     while len(row) < col_idx:
         row.append("")
     row[col_idx - 1] = value
+
+
+def get_client_details(name: str):
+    """
+    Returns a dict of all known fields for one client (matched by exact,
+    case-insensitive name), or None if not found. Includes this month's
+    paid/pending figures too.
+    """
+    headers, data_rows = get_all_data()
+    target = name.strip().lower()
+
+    row = None
+    for r in data_rows:
+        if len(r) >= COL_CLIENT and r[COL_CLIENT - 1].strip().lower() == target:
+            row = r
+            break
+    if row is None:
+        return None
+
+    def cell(col_idx):
+        return row[col_idx - 1].strip() if col_idx and len(row) >= col_idx else ""
+
+    package_raw = cell(COL_PACKAGE)
+    try:
+        expected = float(package_raw.replace(",", "")) if package_raw else 0.0
+    except ValueError:
+        expected = 0.0
+
+    month_name = current_month_name()
+    month_col = find_month_column(headers, month_name)
+    paid_raw = cell(month_col) if month_col else ""
+    try:
+        paid = float(paid_raw.replace(",", "")) if paid_raw else 0.0
+    except ValueError:
+        paid = expected if paid_raw.lower() in ("done", "paid", "yes") else 0.0
+
+    return {
+        "name": cell(COL_CLIENT),
+        "package": expected,
+        "email": cell(COL_EMAIL),
+        "frequency": cell(find_column(headers, HEADER_FREQUENCY)),
+        "platform": cell(find_column(headers, HEADER_PLATFORM)),
+        "additional": cell(find_column(headers, HEADER_ADDITIONAL)),
+        "joining_date": cell(find_column(headers, HEADER_JOINING_DATE)),
+        "month_name": month_name,
+        "paid_this_month": paid,
+        "pending_this_month": max(expected - paid, 0.0),
+    }
 
 
 def get_clients_with_payment(headers, data_rows, month_col_idx):
@@ -362,6 +412,70 @@ async def send_night_update(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg)
 
 
+async def send_due_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs once a day. For each client, treats their Joining Date's day-of-month
+    as their recurring billing day (e.g. joined on the 15th -> billed on the
+    15th every month; clamped to the last day of shorter months). If today
+    is that day and their current-month payment isn't fully paid, they're
+    included in a reminder message posted to the group.
+    """
+    headers, data_rows = get_all_data()
+    month_name = current_month_name()
+    month_col = find_month_column(headers, month_name)
+    joining_col = find_column(headers, HEADER_JOINING_DATE)
+
+    if not joining_col:
+        return  # no Joining Date column set up yet, nothing to check
+
+    today = datetime.now(ZoneInfo(TIMEZONE))
+    days_in_month = calendar.monthrange(today.year, today.month)[1]
+
+    due_today = []
+    for row in data_rows:
+        name = row[COL_CLIENT - 1].strip() if len(row) >= COL_CLIENT else ""
+        package_raw = row[COL_PACKAGE - 1].strip() if len(row) >= COL_PACKAGE else ""
+        if not name or not package_raw:
+            continue
+        try:
+            expected = float(package_raw.replace(",", ""))
+        except ValueError:
+            continue
+
+        paid = 0.0
+        if month_col and len(row) >= month_col:
+            cell_val = row[month_col - 1].strip()
+            if cell_val:
+                try:
+                    paid = float(cell_val.replace(",", ""))
+                except ValueError:
+                    if cell_val.lower() in ("done", "paid", "yes"):
+                        paid = expected
+        pending = expected - paid
+        if pending <= 0:
+            continue  # already fully paid, nothing to remind about
+
+        joining_raw = row[joining_col - 1].strip() if len(row) >= joining_col else ""
+        if not joining_raw:
+            continue
+        try:
+            joining_date = datetime.strptime(joining_raw, DATE_FORMAT)
+        except ValueError:
+            continue
+
+        billing_day = min(joining_date.day, days_in_month)
+        if today.day == billing_day:
+            due_today.append((name, pending))
+
+    if not due_today:
+        return
+
+    lines = ["🔔 Payment due today:", ""]
+    for name, pending in due_today:
+        lines.append(f"• {name} — ₹{pending:,.0f} pending")
+    await context.bot.send_message(chat_id=GROUP_CHAT_ID, text="\n".join(lines))
+
+
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual trigger: /summary"""
     msg = build_summary_message("📊 Client summary (on request):")
@@ -372,6 +486,67 @@ async def total_client_command(update: Update, context: ContextTypes.DEFAULT_TYP
     """Manual trigger: /total or the phrase 'total client'"""
     msg = build_summary_message("📊 Total client list:")
     await update.message.reply_text(msg)
+
+
+async def details_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles:
+        details John Doe
+        /details John Doe
+    Shows everything known about one client.
+    """
+    text = update.message.text.strip()
+
+    if text.lower().startswith("/details"):
+        text = text[8:].strip()
+    elif text.lower().startswith("details"):
+        text = text[7:].strip()
+
+    name = text.strip()
+    if not name:
+        await update.message.reply_text(
+            "Please use the format:\ndetails Client Name\n(e.g. details John Doe)"
+        )
+        return
+
+    try:
+        info = get_client_details(name)
+    except Exception as e:
+        logger.exception("Failed to fetch client details")
+        await update.message.reply_text(f"⚠️ Failed to read the sheet: {e}")
+        return
+
+    if not info:
+        await update.message.reply_text(f"⚠️ No client found matching: {name}")
+        return
+
+    if info["pending_this_month"] <= 0:
+        payment_line = f"✅ Paid in full for {info['month_name']} (₹{info['paid_this_month']:,.0f})"
+    elif info["paid_this_month"] > 0:
+        payment_line = (
+            f"⏳ ₹{info['paid_this_month']:,.0f} paid, "
+            f"₹{info['pending_this_month']:,.0f} pending for {info['month_name']}"
+        )
+    else:
+        payment_line = f"⏳ ₹{info['pending_this_month']:,.0f} pending for {info['month_name']}"
+
+    lines = [
+        f"👤 {info['name']}",
+        f"💰 Package: ₹{info['package']:,.0f}",
+        payment_line,
+    ]
+    if info["email"]:
+        lines.append(f"📧 Email: {info['email']}")
+    if info["frequency"]:
+        lines.append(f"📅 Frequency: {info['frequency']}")
+    if info["platform"]:
+        lines.append(f"📱 Platform: {info['platform']}")
+    if info["additional"]:
+        lines.append(f"➕ Additional: {info['additional']}")
+    if info["joining_date"]:
+        lines.append(f"🗓️ Joining Date: {info['joining_date']}")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +911,8 @@ async def plain_text_dispatcher(update: Update, context: ContextTypes.DEFAULT_TY
         await edit_command(update, context)
     elif text.startswith("setjoin "):
         await setjoin_command(update, context)
+    elif text.startswith("details "):
+        await details_command(update, context)
     elif text in ("total client", "total clients"):
         await total_client_command(update, context)
     elif text.endswith(" done") or " done " in text:
@@ -758,6 +935,7 @@ def main():
     app.add_handler(CommandHandler("remove", remove_command))
     app.add_handler(CommandHandler("edit", edit_command))
     app.add_handler(CommandHandler("setjoin", setjoin_command))
+    app.add_handler(CommandHandler("details", details_command))
 
     # Conversation handler must be added before the generic dispatcher so
     # "add ..." messages get captured by the step-by-step flow.
@@ -767,6 +945,7 @@ def main():
 
     app.job_queue.run_daily(send_morning_update, time=MORNING_TIME, name="morning_update")
     app.job_queue.run_daily(send_night_update, time=NIGHT_TIME, name="night_update")
+    app.job_queue.run_daily(send_due_reminders, time=REMINDER_TIME, name="due_reminders")
 
     # Start the keep-alive web server in the background so Render sees
     # inbound traffic (from UptimeRobot) and doesn't put this service to sleep.
